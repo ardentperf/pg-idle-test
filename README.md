@@ -31,7 +31,7 @@ When a Postgres session is in the "idle in transaction (aborted)" state, it mean
 3. **Session Persistence**: Shows the session still exists in pg_stat_activity even after locks are released
 4. **No Blocking**: Verifies another session can immediately modify the same row
 
-## Test 2: idle_in_transaction_session_timeout - Connection Termination
+## Test 2: Idle Transaction Timeout
 
 **Script:** `test_idle_in_transaction_timeout.sh`
 
@@ -50,18 +50,7 @@ When a Postgres session is in the "idle in transaction (aborted)" state, it mean
 3. **Connection Termination**: Proves the session is completely removed from pg_stat_activity (not in aborted state)
 4. **No Blocking**: Verifies another session can immediately modify the same row
 
-## Key Differences
-
-| Behavior | Error in Transaction | idle_in_transaction_session_timeout |
-|----------|---------------------|-------------------------------------|
-| Trigger | SQL error (division by zero, etc.) | Timeout while idle in transaction |
-| Session State | "idle in transaction (aborted)" | Connection terminated (gone) |
-| Visible in pg_stat_activity? | Yes | No |
-| Row locks released? | Yes | Yes |
-| Connection still open? | Yes | No |
-| Requires explicit ROLLBACK? | Yes | No (automatic) |
-
-## Test 3: Network Partition Scenario
+## Test 3: Idle Transaction Timeout with Network Partition
 
 **Script:** `test_network_partition.sh`
 
@@ -83,8 +72,19 @@ This test demonstrates what happens when `idle_in_transaction_session_timeout` f
 - The server-side timeout works correctly even when packets are dropped
 - Server doesn't wait for client acknowledgment to release resources
 - Locks are released immediately upon backend termination
-- TCP connection enters FIN_WAIT1 (server sent FIN, waiting for ACK that never comes)
-- The FIN_WAIT1 state will eventually timeout at the OS level
+- Client never receives the termination notification
+
+## Key Differences: Server-Side Session Termination
+
+| Scenario | Trigger | Session State | Visible in pg_stat_activity? | Row locks released? | Connection still open? | Requires explicit ROLLBACK? | Client receives notification? |
+|----------|---------|---------------|------------------------------|---------------------|------------------------|----------------------------|-------------------------------|
+| **Error-Induced Transaction Abort** | SQL error (division by zero, etc.) | "idle in transaction (aborted)" | Yes | Yes | Yes | Yes | Yes |
+| **Idle Transaction Timeout** | Timeout while idle in transaction | Connection terminated (gone) | No | Yes | No | No (automatic) | Yes |
+| **Idle Transaction Timeout with Network Partition** | Timeout with dropped packets | Connection terminated (gone) | No | Yes | No | No (automatic) | No (packets dropped) |
+
+## Client-Side Disconnection Tests
+
+These tests focus on scenarios where the client disconnects or is terminated.
 
 ## Test 4: Client Kill with Blocked Query
 
@@ -113,6 +113,40 @@ This means that if a client in a retry loop opens new connections and then forci
 - Blocked backends don't check socket state until they try to read/write the socket
 - When the lock is released, the backend discovers "unexpected EOF on client connection"
 
+## Test 5: Client Context Cancellation with Blocked Query
+
+**Script:** `test_client_cancel.sh`
+
+### What This Tests
+
+This test demonstrates what happens when a Go client using `database/sql` with `pgx` driver times out via context deadline while blocked waiting for a lock. Unlike SIGKILL, the pgx driver sends a proper `CancelRequest` to PostgreSQL.
+
+### What the Test Demonstrates
+
+1. **Context Timeout**: Go client uses `context.WithTimeout(5 seconds)` for the query
+2. **Lock Blocking**: Client A holds a lock, Client B blocks waiting for it
+3. **Timeout Triggers**: After 5 seconds, context deadline fires
+4. **Cancel Request Sent**: pgx driver's `asyncClose()` sends `CancelRequest` to PostgreSQL
+5. **Immediate Termination**: Backend receives cancel and terminates the blocked query immediately
+6. **Clean Connection Close**: TCP connection closes cleanly (no CLOSE-WAIT)
+
+### Key Findings
+
+- pgx DOES send `CancelRequest` on context timeout (via `asyncClose()`)
+- Backend receives the cancel and terminates immediately
+- No orphaned backends or CLOSE-WAIT accumulation
+- Connection closes cleanly without requiring lock release
+
+## Comparison: Client-Side Disconnection Scenarios
+
+| Scenario | Cancel Sent? | Backend Terminates? | Connection Released? | TCP State |
+|----------|--------------|---------------------|----------------------|-----------|
+| **Context timeout (pgx)** | ✅ Yes | ✅ Immediately | ✅ Yes (immediate) | Clean |
+| **SIGKILL / kill -9** | ❌ No | ❌ Stays blocked | ❌ No (until unblocked) | CLOSE-WAIT |
+| **pg_cancel_backend()** | ✅ Yes | ✅ Immediately | ✅ Yes (immediate) | Clean |
+
+**Note:** "Connection Released" indicates when the server releases the connection slot and it no longer counts toward `max_connections`.
+
 ## Running the Tests
 
 *Note: Uses Postgres latest version in Docker*
@@ -121,6 +155,7 @@ This means that if a client in a retry loop opens new connections and then forci
 
 - Docker installed and available
 - Bash shell
+- Go toolchain (required for Test 5 only)
 
 **View sample output:** https://github.com/ardentperf/pg-idle-test/actions/workflows/test.yml
 
@@ -136,4 +171,7 @@ This means that if a client in a retry loop opens new connections and then forci
 
 # Test 4: Client kill with blocked query
 ./test_client_kill.sh
+
+# Test 5: Client context cancellation with blocked query
+./test_client_cancel.sh
 ```

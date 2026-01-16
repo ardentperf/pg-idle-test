@@ -10,6 +10,16 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+    
+    - name: Initialize Go module and download dependencies
+      run: |
+        go mod init github.com/test/idle-test
+        go get github.com/jackc/pgx/v5/stdlib
+    
     - name: Test 1 - Error-Induced Aborted State
       run: bash test_idle_in_transaction_aborted.sh
     
@@ -21,3 +31,6 @@ jobs:
     
     - name: Test 4 - Client Kill with Blocked Query
       run: bash test_client_kill.sh
+    
+    - name: Test 5 - Client Context Cancellation with Blocked Query
+      run: bash test_client_cancel.sh
