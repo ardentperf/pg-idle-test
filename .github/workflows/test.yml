@@ -18,3 +18,6 @@ jobs:
     
     - name: Test 3 - Network Partition
       run: bash test_network_partition.sh
+    
+    - name: Test 4 - Client Kill with Blocked Query
+      run: bash test_client_kill.sh
