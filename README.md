@@ -2,9 +2,15 @@
 
 # Postgres Transaction State Tests
 
-This repository contains test scripts to validate different Postgres transaction behaviors, specifically focusing on "idle in transaction (aborted)" state and `idle_in_transaction_session_timeout`.
+This repository contains test scripts to validate different Postgres transaction and connection behaviors, including transaction states, timeouts, network partitions, and client disconnection handling.
 
-## Test 1: idle in transaction (aborted) - Error-Induced State
+**View sample output:** https://github.com/ardentperf/pg-idle-test/actions/workflows/test.yml
+
+## Server-Side Session Termination Tests
+
+These tests focus on scenarios where the database server terminates sessions.
+
+## Test 1: Error-Induced Transaction Abort
 
 **Script:** `test_idle_in_transaction_aborted.sh`
 
@@ -80,6 +86,33 @@ This test demonstrates what happens when `idle_in_transaction_session_timeout` f
 - TCP connection enters FIN_WAIT1 (server sent FIN, waiting for ACK that never comes)
 - The FIN_WAIT1 state will eventually timeout at the OS level
 
+## Test 4: Client Kill with Blocked Query
+
+**Script:** `test_client_kill.sh`
+
+### What This Tests
+
+This test demonstrates what happens when a client is forcibly killed (SIGKILL) while its query is blocked waiting for a lock. Postgres does not immediately detect the broken connection.
+
+This means that if a client in a retry loop opens new connections and then forcibly kills them when they timeout waiting for a lock, those queries will wait indefinitely until the database server runs out of available connections. (This is the default behavior of golang context deadlines.)
+
+### What the Test Demonstrates
+
+1. **TCP Keepalive Configuration**: Sets aggressive keepalive (idle=10s, interval=3s, count=3)
+2. **Lock Blocking**: Session A holds a lock (idle in transaction), Session B blocks waiting for it
+3. **Client Kill**: Session B's psql process is killed with SIGKILL while blocked
+4. **TCP State Monitoring**: Shows connection goes to CLOSE-WAIT (OS knows client is dead)
+5. **Backend Persistence**: Proves Session B's backend persists for 60+ seconds despite keepalive
+6. **Cleanup on Unblock**: Backend only detects dead client when the lock is released and it tries to send data
+
+### Key Findings
+
+- TCP connection goes to CLOSE-WAIT immediately after client kill (OS detects the dead connection)
+- But Session B's Postgres backend remains "active" and blocked on the lock for 60+ seconds
+- TCP keepalive does not work for blocked backends
+- Blocked backends don't check socket state until they try to read/write the socket
+- When the lock is released, the backend discovers "unexpected EOF on client connection"
+
 ## Running the Tests
 
 *Note: Uses Postgres latest version in Docker*
@@ -88,6 +121,8 @@ This test demonstrates what happens when `idle_in_transaction_session_timeout` f
 
 - Docker installed and available
 - Bash shell
+
+**View sample output:** https://github.com/ardentperf/pg-idle-test/actions/workflows/test.yml
 
 ```bash
 # Test 1: Error-induced aborted state
@@ -98,4 +133,7 @@ This test demonstrates what happens when `idle_in_transaction_session_timeout` f
 
 # Test 3: Timeout with network partition
 ./test_network_partition.sh
+
+# Test 4: Client kill with blocked query
+./test_client_kill.sh
 ```
