@@ -1,0 +1,20 @@
+name: Run Postgres Transaction Tests
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Test 1 - Error-Induced Aborted State
+      run: bash test_idle_in_transaction_aborted.sh
+    
+    - name: Test 2 - Timeout-Induced Termination
+      run: bash test_idle_in_transaction_timeout.sh
+    
+    - name: Test 3 - Network Partition
+      run: bash test_network_partition.sh
