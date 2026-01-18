@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
+  basic-tests:
     runs-on: ubuntu-latest
     
     steps:
@@ -14,11 +14,6 @@ jobs:
       uses: actions/setup-go@v5
       with:
         go-version: '1.21'
-    
-    - name: Initialize Go module and download dependencies
-      run: |
-        go mod init github.com/test/idle-test
-        go get github.com/jackc/pgx/v5/stdlib
     
     - name: Test 1 - Error-Induced Aborted State
       run: bash test_idle_in_transaction_aborted.sh
@@ -34,3 +29,79 @@ jobs:
     
     - name: Test 5 - Client Context Cancellation with Blocked Query
       run: bash test_client_cancel.sh
+
+  conn-exhaustion-2pgb-poison:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+    
+    - name: Pull Docker images
+      working-directory: ./conn_exhaustion
+      run: docker compose pull
+    
+    - name: Test - Connection Exhaustion (2 PgBouncers, poison mode)
+      working-directory: ./conn_exhaustion
+      run: bash test_poisoned_connpool_exhaustion.sh 2 poison
+
+  conn-exhaustion-2pgb-sleep:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+    
+    - name: Pull Docker images
+      working-directory: ./conn_exhaustion
+      run: docker compose pull
+    
+    - name: Test - Connection Exhaustion (2 PgBouncers, sleep mode)
+      working-directory: ./conn_exhaustion
+      run: bash test_poisoned_connpool_exhaustion.sh 2 sleep
+
+  conn-exhaustion-1pgb-poison:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+    
+    - name: Pull Docker images
+      working-directory: ./conn_exhaustion
+      run: docker compose pull
+    
+    - name: Test - Connection Exhaustion (1 PgBouncer, poison mode)
+      working-directory: ./conn_exhaustion
+      run: bash test_poisoned_connpool_exhaustion.sh 1 poison
+
+  conn-exhaustion-1pgb-sleep:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+    
+    - name: Pull Docker images
+      working-directory: ./conn_exhaustion
+      run: docker compose pull
+    
+    - name: Test - Connection Exhaustion (1 PgBouncer, sleep mode)
+      working-directory: ./conn_exhaustion
+      run: bash test_poisoned_connpool_exhaustion.sh 1 sleep
