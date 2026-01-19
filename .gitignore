@@ -13,3 +13,6 @@ conn_exhaustion/results/
 conn_exhaustion/pgbouncer_configs/
 conn_exhaustion/docker-compose.pgbouncers.yml
 
+# Generated data files (keep PNG graphs)
+conn_exhaustion/graphs/*.dat
+
