@@ -1,7 +1,15 @@
-
 # Go build artifacts
 test_client_cancel_driver_linux
 conn_exhaustion/poison_connpool_linux
 
 # Log files
-conn_exhaustion/*.log
+*.log
+*.log.*
+
+# Temporary test results
+conn_exhaustion/results/
+
+# Generated pgbouncer configs
+conn_exhaustion/pgbouncer_configs/
+conn_exhaustion/docker-compose.pgbouncers.yml
+

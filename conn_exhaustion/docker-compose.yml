@@ -4,28 +4,18 @@ services:
     environment:
       POSTGRES_PASSWORD: test
       POSTGRES_DB: testdb
-    command: postgres -c max_connections=100 -c log_connections=on -c log_disconnections=on -c idle_in_transaction_session_timeout=10000 -c superuser_reserved_connections=5
+    command: >
+      postgres
+      -c max_connections=100
+      -c superuser_reserved_connections=5
+      -c idle_in_transaction_session_timeout=20000
+      -c transaction_timeout=40000
+      -c log_connections=on
+      -c log_disconnections=on
     networks:
       - backend
 
-  pgbouncer:
-    image: edoburu/pgbouncer:v1.25.1-p0
-    environment:
-      DATABASE_URL: postgres://postgres:test@postgres:5432/testdb
-      POOL_MODE: transaction
-      MAX_CLIENT_CONN: 200
-      DEFAULT_POOL_SIZE: 10
-      MAX_DB_CONNECTIONS: 10
-      MAX_USER_CONNECTIONS: 195  # dont let app consume all conns; reserve some for monitoring w different user
-      LOG_DISCONNECTIONS: 1
-      LOG_CONNECTIONS: 1
-      STATS_PERIOD: 1
-      AUTH_TYPE: scram-sha-256
-      ADMIN_USERS: postgres
-    depends_on:
-      - postgres
-    networks:
-      - backend
+  # PgBouncer services (pgb1, pgb2, ...) are generated in docker-compose.pgbouncers.yml
 
   haproxy:
     image: haproxy:3.1
@@ -33,11 +23,10 @@ services:
       - "6432:6432"
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-    depends_on:
-      - pgbouncer
     networks:
       - backend
 
 networks:
   backend:
     driver: bridge
+    name: conn_exhaustion_backend

@@ -1,9 +1,10 @@
 #!/bin/bash
 set -e
 
-[ -z "$2" ] && echo "Usage: $0 [number of pgbouncers] [mode: poison|sleep]" && exit 1
+[ -z "$3" ] && echo "Usage: $0 <num_pgbouncers> <poison|sleep> <peers|nopeers>" && exit 1
 NUM_PGBOUNCERS=$1
 MODE="$2"
+PEERS_MODE="$3"
 
 POSTGRES_USER="testuser"
 POSTGRES_PASSWORD="test"
@@ -20,21 +21,68 @@ exec > >(tee "$CONSOLE_LOG") 2>&1
 cleanup() {
     docker stop conn_exhaustion_client 2>/dev/null || true
     docker rm conn_exhaustion_client 2>/dev/null || true
-    docker compose down 2>/dev/null || true
-    rm -f poison_connpool_linux
+    docker compose -f docker-compose.yml -f docker-compose.pgbouncers.yml down 2>/dev/null || true
+    rm -f poison_connpool_linux docker-compose.pgbouncers.yml
+    rm -rf pgbouncer_configs
 }
 trap cleanup EXIT INT TERM
 
 echo "======================================"
 echo "PgBouncer Connection Exhaustion Test"
-echo "PgBouncer instances: $NUM_PGBOUNCERS"
+echo "PgBouncer instances: $NUM_PGBOUNCERS, mode: $MODE, peers: $PEERS_MODE"
 echo "======================================"
+
+# Generate pgbouncer configs and docker-compose override
+rm -rf pgbouncer_configs && mkdir -p pgbouncer_configs
+for i in $(seq 1 $NUM_PGBOUNCERS); do
+    cat > pgbouncer_configs/pgbouncer_${i}.ini << PGBCFG
+[databases]
+testdb = host=postgres port=5432 dbname=testdb
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 5432
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+admin_users = postgres
+pool_mode = transaction
+max_client_conn = 200
+default_pool_size = 10
+max_db_connections = 10
+max_user_connections = 195
+log_connections = 1
+log_disconnections = 1
+stats_period = 1
+PGBCFG
+    # Only add peer config in peers mode
+    if [ "$PEERS_MODE" = "peers" ]; then
+        echo "peer_id = ${i}" >> pgbouncer_configs/pgbouncer_${i}.ini
+        echo "[peers]" >> pgbouncer_configs/pgbouncer_${i}.ini
+        for j in $(seq 1 $NUM_PGBOUNCERS); do
+            echo "${j} = host=pgb${j} port=5432" >> pgbouncer_configs/pgbouncer_${i}.ini
+        done
+    fi
+done
+
+# Generate docker-compose file for pgbouncer services
+echo "services:" > docker-compose.pgbouncers.yml
+for i in $(seq 1 $NUM_PGBOUNCERS); do
+    cat >> docker-compose.pgbouncers.yml << DCCFG
+  pgb${i}:
+    image: edoburu/pgbouncer:v1.25.1-p0
+    entrypoint: [pgbouncer, /etc/pgbouncer/pgbouncer.ini]
+    volumes: [./pgbouncer_configs/pgbouncer_${i}.ini:/etc/pgbouncer/pgbouncer.ini:ro, ./userlist.txt:/etc/pgbouncer/userlist.txt:ro]
+    depends_on: [postgres]
+    networks:
+      backend:
+        aliases: [pgbouncer]
+DCCFG
+done
 
 # Build and start services
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o poison_connpool_linux poison_connpool.go
-docker compose down 2>/dev/null || true
+docker compose -f docker-compose.yml -f docker-compose.pgbouncers.yml down 2>/dev/null || true
 docker rm -f conn_exhaustion_client 2>/dev/null || true
-docker compose up -d --scale pgbouncer=$NUM_PGBOUNCERS
+docker compose -f docker-compose.yml -f docker-compose.pgbouncers.yml up -d
 
 # Wait for PostgreSQL
 echo "Waiting for PostgreSQL..."
@@ -67,8 +115,9 @@ docker exec -e "DATABASE_URL=postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@$HAPRO
 # Monitor
 echo ""
 echo "=== Monitoring ==="
-prev_xact_commit=0
-for i in {1..50}; do
+prev_xact_commit=""
+start_time=$(date +%s)
+while [ $(($(date +%s) - start_time)) -lt 95 ]; do
     sleep 1
     
     timestamp=$(date +%M:%S)
@@ -82,7 +131,7 @@ for i in {1..50}; do
     xact_commit=$(docker exec $POSTGRES_CONTAINER psql -U postgres -d testdb -t -c "
         SELECT xact_commit FROM pg_stat_database WHERE datname='testdb'" 2>/dev/null | tr -d ' ')
     
-    if [ $i -gt 1 ]; then
+    if [ -n "$prev_xact_commit" ]; then
         tps=$((xact_commit - prev_xact_commit))
     else
         tps=0
@@ -92,30 +141,19 @@ for i in {1..50}; do
     pgb_sv_active=""
     pgb_cl_active=""
     pgb_cl_waiting=""
+    containers=$(for n in $(seq 1 $NUM_PGBOUNCERS); do docker compose -f docker-compose.yml -f docker-compose.pgbouncers.yml ps -q pgb${n}; done)
     bouncer_num=1
-    for container in $(docker compose ps -q pgbouncer); do
-        # PgBouncer 1.25.1 SHOW POOLS columns: database | user | cl_active | cl_waiting | cl_active_cancel_req | cl_waiting_cancel_req | sv_active | ...
-        # With -t flag, pipes are fields: col 1=database, 3=user, 5=cl_active, 7=cl_waiting, 13=sv_active
+    for container in $containers; do
         sums=$(docker exec $container sh -c 'PGPASSWORD=test psql -h 127.0.0.1 -p 5432 -U postgres -d pgbouncer -t -c "SHOW POOLS"' 2>/dev/null | awk 'NF > 0 {cl_act += $5; sv_act += $13; cl_wait += $7} END {print cl_act+0 "," sv_act+0 "," cl_wait+0}')
-        
-        # Check if we got valid stats (non-empty and contains commas)
         if [ -z "$sums" ] || [[ ! "$sums" =~ , ]]; then
-            cl_active="ERR"
-            sv_active="ERR"
-            cl_waiting="ERR"
+            cl_active="ERR"; sv_active="ERR"; cl_waiting="ERR"
         else
             IFS=',' read -r cl_active sv_active cl_waiting <<< "$sums"
         fi
-        
-        # Build per-bouncer stats strings
         if [ $bouncer_num -eq 1 ]; then
-            pgb_cl_active="${cl_active:-ERR}"
-            pgb_cl_waiting="${cl_waiting:-ERR}"
-            pgb_sv_active="${sv_active:-ERR}"
+            pgb_cl_active="${cl_active:-ERR}"; pgb_cl_waiting="${cl_waiting:-ERR}"; pgb_sv_active="${sv_active:-ERR}"
         else
-            pgb_cl_active="${pgb_cl_active}:${cl_active:-ERR}"
-            pgb_cl_waiting="${pgb_cl_waiting}:${cl_waiting:-ERR}"
-            pgb_sv_active="${pgb_sv_active}:${sv_active:-ERR}"
+            pgb_cl_active="${pgb_cl_active}:${cl_active:-ERR}"; pgb_cl_waiting="${pgb_cl_waiting}:${cl_waiting:-ERR}"; pgb_sv_active="${pgb_sv_active}:${sv_active:-ERR}"
         fi
         bouncer_num=$((bouncer_num + 1))
     done
@@ -136,10 +174,9 @@ echo "=== Capturing logs ==="
 docker logs $POSTGRES_CONTAINER > "$POSTGRES_LOG" 2>&1
 docker exec conn_exhaustion_client cat /tmp/client_stderr.log > "$CLIENT_LOG" 2>/dev/null || true
 
-idx=1
-for container in $(docker compose ps -q pgbouncer); do
+for idx in $(seq 1 $NUM_PGBOUNCERS); do
+    container=$(docker compose -f docker-compose.yml -f docker-compose.pgbouncers.yml ps -q pgb${idx})
     docker logs $container > "pgbouncer_${idx}.log" 2>&1
-    idx=$((idx + 1))
 done
 
 grep POOL_STATS "$CLIENT_LOG"
@@ -149,6 +186,7 @@ echo ""
 echo "=== Results & Log Files ==="
 canceling=$(grep -c 'canceling statement' "$POSTGRES_LOG" || echo 0)
 idle_timeout=$(grep -c 'terminating connection due to idle-in-transaction timeout' "$POSTGRES_LOG" | tr -d '\n' || echo 0)
+transaction_timeout=$(grep -c 'terminating connection due to transaction timeout' "$POSTGRES_LOG" | tr -d '\n' || echo 0)
 client_deadline=$(grep -c 'context deadline exceeded' "$CLIENT_LOG" | tr -d '\n' || echo 0)
 client_superuser=$(grep -c 'reserved for roles with the SUPERUSER' "$CLIENT_LOG" | tr -d '\n' || echo 0)
 client_max_conn=$(grep -c 'no more connections allowed (max_client_conn)' "$CLIENT_LOG" | tr -d '\n' || echo 0)
@@ -156,7 +194,6 @@ client_open_txn=$(grep -c 'Connection returned to pool with open transaction' "$
 
 failed_cancel=0
 not_ready=0
-cancel_timeout=0
 pgb_logs=""
 for i in $(seq 1 $NUM_PGBOUNCERS); do
     if [ -f "pgbouncer_${i}.log" ]; then
@@ -164,20 +201,18 @@ for i in $(seq 1 $NUM_PGBOUNCERS); do
         failed_cancel=$((failed_cancel + fc))
         nr=$(grep -c "disconnect.*not ready" "pgbouncer_${i}.log" | tr -d '\n' || echo 0)
         not_ready=$((not_ready + nr))
-        ct=$(grep -c "cancel_wait_timeout" "pgbouncer_${i}.log" | tr -d '\n' || echo 0)
-        cancel_timeout=$((cancel_timeout + ct))
         [ -n "$pgb_logs" ] && pgb_logs="$pgb_logs, "
         pgb_logs="${pgb_logs}pgbouncer_${i}.log"
     fi
 done
 
 printf "%-45s %6s   %s\n" "Metric" "Count" "Log File(s)"
-printf "%-45s %6s   %s\n" "─────────────────────────────────────────────" "─────" "─────────────────────────────────"
+printf "%-45s %6s   %s\n" "─────────────────────────────────────────────" "-─────" "─────────────────────────────────"
 printf "%-45s %6s   %s\n" "PostgreSQL canceling statement" "$canceling" "$POSTGRES_LOG"
 printf "%-45s %6s   %s\n" "Idle-in-transaction timeouts" "$idle_timeout" "$POSTGRES_LOG"
+printf "%-45s %6s   %s\n" "Transaction timeouts" "$transaction_timeout" "$POSTGRES_LOG"
 printf "%-45s %6s   %s\n" "PgBouncer failed cancel requests" "$failed_cancel" "$pgb_logs"
 printf "%-45s %6s   %s\n" "PgBouncer disconnect while not ready" "$not_ready" "$pgb_logs"
-printf "%-45s %6s   %s\n" "PgBouncer cancel wait timeouts" "$cancel_timeout" "$pgb_logs"
 printf "%-45s %6s   %s\n" "Client context deadline exceeded" "$client_deadline" "$CLIENT_LOG"
 printf "%-45s %6s   %s\n" "Client superuser reserved connections" "$client_superuser" "$CLIENT_LOG"
 printf "%-45s %6s   %s\n" "Client PgBouncer max_client_conn" "$client_max_conn" "$CLIENT_LOG"
@@ -185,8 +220,10 @@ printf "%-45s %6s   %s\n" "Client open transaction in pool" "$client_open_txn" "
 
 echo ""
 echo "======================================"
-echo "Expected with 2+ PgBouncers:"
-echo "  - PgBouncer cl_wait spikes to max_client_conn"
-echo "  - CLOSE_WAIT accumulates (misrouted cancels)"
-echo "  - Backends max out near 95/100"
+echo "Expected results:"
+echo "  - 2 PgB + poison + nopeers: TPS drop, cl_waiting spikes, backends max out near 95, system outage"
+echo "  - 1 PgB + poison + nopeers: TPS drops, but connections stay healthy, system available"
+echo "  - 2 PgB + poison + peers: TPS drops, cl_waiting stays low, backends stay low, system available"
+echo "  - 2 PgB + sleep + nopeers: TPS drops briefly, then full recovery"
+echo "  - 2 PgB + sleep + peers: TPS drops briefly, then full recovery, no connection spike"
 echo "======================================"

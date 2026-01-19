@@ -120,7 +120,7 @@ func main() {
 	time.Sleep(20 * time.Second)
 
 	fmt.Println()
-	fmt.Println(">>> POISONING CONNECTION POOL: Holding row lock in open transaction...")
+	fmt.Println(">>> START BLOCKING: Holding row lock in open transaction...")
 
 	conn, _ := db.Conn(context.Background())
 	var backendPID int
@@ -131,15 +131,14 @@ func main() {
 	if os.Args[1] == "poison" {
 		// Return connection to pool immediately with open transaction (default "poison" behavior)
 		conn.Close()
-		fmt.Printf(">>> Lock acquired by PID %d, connection returned to pool\n", backendPID)
+		fmt.Printf(">>> POISON: Lock acquired by PID %d, connection returned to pool with open transaction\n", backendPID)
 		// Sleep so that workers continue to run; poison connection picked up and will not be idle
-		time.Sleep(40 * time.Second)
+		time.Sleep(70 * time.Second)
 	} else {
 		// Sleep before completing test; workers blocked by idle transaction
-		fmt.Printf(">>> Lock acquired by PID %d, sleeping 40s before returning to pool\n", backendPID)
-		time.Sleep(40 * time.Second)
+		fmt.Printf(">>> SLEEP: Lock acquired by PID %d, sleeping with open transaction\n", backendPID)
+		time.Sleep(70 * time.Second)
 		conn.Close()
-		fmt.Println(">>> Connection returned to pool")
 	}
 
 	fmt.Println()
