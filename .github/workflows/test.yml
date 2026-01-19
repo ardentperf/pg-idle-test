@@ -30,7 +30,7 @@ jobs:
     - name: Test 5 - Client Context Cancellation with Blocked Query
       run: bash test_client_cancel.sh
 
-  conn-exhaustion-2pgb-poison:
+  conn-exhaustion-2pgb-poison-nopool:
     runs-on: ubuntu-latest
     
     steps:
@@ -43,13 +43,16 @@ jobs:
     
     - name: Pull Docker images
       working-directory: ./conn_exhaustion
-      run: docker compose pull
+      run: |
+        docker compose pull
+        docker pull edoburu/pgbouncer:v1.25.1-p0
+        docker pull alpine:latest
     
-    - name: Test - Connection Exhaustion (2 PgBouncers, poison mode)
+    - name: Test - Connection Exhaustion (2 PgBouncers, poison, nopool)
       working-directory: ./conn_exhaustion
-      run: bash test_poisoned_connpool_exhaustion.sh 2 poison
+      run: bash test_poisoned_connpool_exhaustion.sh 2 poison nopeers
 
-  conn-exhaustion-2pgb-sleep:
+  conn-exhaustion-1pgb-poison-nopool:
     runs-on: ubuntu-latest
     
     steps:
@@ -62,13 +65,16 @@ jobs:
     
     - name: Pull Docker images
       working-directory: ./conn_exhaustion
-      run: docker compose pull
+      run: |
+        docker compose pull
+        docker pull edoburu/pgbouncer:v1.25.1-p0
+        docker pull alpine:latest
     
-    - name: Test - Connection Exhaustion (2 PgBouncers, sleep mode)
+    - name: Test - Connection Exhaustion (1 PgBouncer, poison, nopool)
       working-directory: ./conn_exhaustion
-      run: bash test_poisoned_connpool_exhaustion.sh 2 sleep
+      run: bash test_poisoned_connpool_exhaustion.sh 1 poison nopeers
 
-  conn-exhaustion-1pgb-poison:
+  conn-exhaustion-2pgb-sleep-nopool:
     runs-on: ubuntu-latest
     
     steps:
@@ -81,13 +87,16 @@ jobs:
     
     - name: Pull Docker images
       working-directory: ./conn_exhaustion
-      run: docker compose pull
+      run: |
+        docker compose pull
+        docker pull edoburu/pgbouncer:v1.25.1-p0
+        docker pull alpine:latest
     
-    - name: Test - Connection Exhaustion (1 PgBouncer, poison mode)
+    - name: Test - Connection Exhaustion (2 PgBouncers, sleep, nopool)
       working-directory: ./conn_exhaustion
-      run: bash test_poisoned_connpool_exhaustion.sh 1 poison
+      run: bash test_poisoned_connpool_exhaustion.sh 2 sleep nopeers
 
-  conn-exhaustion-1pgb-sleep:
+  conn-exhaustion-2pgb-poison-pool:
     runs-on: ubuntu-latest
     
     steps:
@@ -100,8 +109,33 @@ jobs:
     
     - name: Pull Docker images
       working-directory: ./conn_exhaustion
-      run: docker compose pull
+      run: |
+        docker compose pull
+        docker pull edoburu/pgbouncer:v1.25.1-p0
+        docker pull alpine:latest
     
-    - name: Test - Connection Exhaustion (1 PgBouncer, sleep mode)
+    - name: Test - Connection Exhaustion (2 PgBouncers, poison, pool)
       working-directory: ./conn_exhaustion
-      run: bash test_poisoned_connpool_exhaustion.sh 1 sleep
+      run: bash test_poisoned_connpool_exhaustion.sh 2 poison peers
+
+  conn-exhaustion-2pgb-sleep-pool:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+    
+    - name: Pull Docker images
+      working-directory: ./conn_exhaustion
+      run: |
+        docker compose pull
+        docker pull edoburu/pgbouncer:v1.25.1-p0
+        docker pull alpine:latest
+    
+    - name: Test - Connection Exhaustion (2 PgBouncers, sleep, pool)
+      working-directory: ./conn_exhaustion
+      run: bash test_poisoned_connpool_exhaustion.sh 2 sleep peers

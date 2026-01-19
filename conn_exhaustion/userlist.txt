@@ -1,0 +1,3 @@
+; PgBouncer userlist format: "username" "password" (or SCRAM-SHA-256 hash)
+"postgres" "test"
+"testuser" "test"

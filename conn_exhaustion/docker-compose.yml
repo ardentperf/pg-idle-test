@@ -8,24 +8,7 @@ services:
     networks:
       - backend
 
-  pgbouncer:
-    image: edoburu/pgbouncer:v1.25.1-p0
-    environment:
-      DATABASE_URL: postgres://postgres:test@postgres:5432/testdb
-      POOL_MODE: transaction
-      MAX_CLIENT_CONN: 200
-      DEFAULT_POOL_SIZE: 10
-      MAX_DB_CONNECTIONS: 10
-      MAX_USER_CONNECTIONS: 195  # dont let app consume all conns; reserve some for monitoring w different user
-      LOG_DISCONNECTIONS: 1
-      LOG_CONNECTIONS: 1
-      STATS_PERIOD: 1
-      AUTH_TYPE: scram-sha-256
-      ADMIN_USERS: postgres
-    depends_on:
-      - postgres
-    networks:
-      - backend
+  # PgBouncer services (pgb1, pgb2, ...) are generated in docker-compose.pgbouncers.yml
 
   haproxy:
     image: haproxy:3.1
@@ -33,11 +16,10 @@ services:
       - "6432:6432"
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-    depends_on:
-      - pgbouncer
     networks:
       - backend
 
 networks:
   backend:
     driver: bridge
+    name: conn_exhaustion_backend
