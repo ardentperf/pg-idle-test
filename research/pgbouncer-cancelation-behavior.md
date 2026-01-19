@@ -1,5 +1,3 @@
-*Written with Claude 👋 - code references have been spot checked, but haven't fully verified everything with tests*
-
 # PgBouncer Cancellation Request Behavior
 
 This document explains how PgBouncer handles query cancellation requests, client disconnections during queries, the related connection states visible in `SHOW POOLS`, and disconnection log messages.
@@ -11,6 +9,7 @@ This document explains how PgBouncer handles query cancellation requests, client
 - [Overview](#overview)
 - [Client Disconnection During a Query](#client-disconnection-during-a-query)
 - [Explicit Cancel Requests](#explicit-cancel-requests)
+- [Cancel Requests in Load-Balanced Setups (Peering)](#cancel-requests-in-load-balanced-setups-peering)
 - [Server States in SHOW POOLS](#server-states-in-show-pools)
 - [Version History](#version-history)
 - [FAQ](#faq)
@@ -200,9 +199,162 @@ LOG S-0xABCD: db/user@10.0.0.1:5432 closing because: successfully sent cancel re
 | `successfully sent cancel request` (S-) | Cancel server connection completed its job and closed | [`src/server.c:763`](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_25_1/src/server.c#L763) |
 | `cancel request for idle client` | Target client's query already finished; nothing to cancel | [`src/objects.c:2217`](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_25_1/src/objects.c#L2217) |
 | `cancel request for console client` | Target is an admin console session; handled internally | [`src/objects.c:2206`](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_25_1/src/objects.c#L2206) |
-| `failed cancel request` | No client found with matching cancel key | [`src/objects.c:2196`](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_25_1/src/objects.c#L2196) |
+| `failed cancel request` | No client found with matching cancel key (see causes below) | [`src/objects.c:2196`](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_25_1/src/objects.c#L2196) |
 | `cancel_wait_timeout` | Cancel request waited too long for a server connection | [`src/janitor.c:462`](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_25_1/src/janitor.c#L462) |
 | `client gave up on cancel request...` | Cancel client disconnected before cancel could be sent; server connection also closed | [`src/objects.c:1540`](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_25_1/src/objects.c#L1540) |
+
+**Causes of `failed cancel request`:**
+
+PgBouncer [searches all clients](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_25_1/src/objects.c#L2175-L2191) to find one with a matching 8-byte cancel key. The cancel key is assigned when the client connects and remains constant for the connection's lifetime. The lookup fails when:
+
+1. **Client already disconnected** — The original connection closed before the cancel request arrived
+2. **Wrong PgBouncer instance** — In load-balanced setups, the cancel request may arrive at a different PgBouncer than the one handling the original connection (this is why [peering](#cancel-requests-in-load-balanced-setups-peering) exists)
+3. **Invalid cancel key** — Corrupted or incorrect key in the cancel request
+
+Note: If the client is found but is idle (query already finished), PgBouncer logs `cancel request for idle client` instead—see the log message table above.
+
+---
+
+## Cancel Requests in Load-Balanced Setups (Peering)
+
+### The Problem
+
+When running multiple PgBouncer instances behind a load balancer (including using `so_reuseport` to have multiple processes on the same port), cancel requests often fail. This is because PostgreSQL's cancel protocol requires the client to open a **new TCP connection** to send the cancel request, and that new connection may be routed to a different PgBouncer instance than the one handling the original query.
+
+```
+                                    Load Balancer
+                                         |
+                    +--------------------+--------------------+
+                    |                                         |
+              PgBouncer A                               PgBouncer B
+                    |                                         |
+              PostgreSQL A                              PostgreSQL B
+
+1. Client connects through load balancer → routed to PgBouncer A
+2. Client runs a long query on PgBouncer A
+3. Client sends cancel request (new connection) → routed to PgBouncer B
+4. PgBouncer B has no record of the cancel key → "failed cancel request"
+```
+
+This is the root cause of the `failed cancel request` log messages in load-balanced deployments.
+
+### The Solution: PgBouncer Peering
+
+Introduced in **PgBouncer 1.19.0** ([#666](https://github.com/pgbouncer/pgbouncer/pull/666)), the peering feature allows multiple PgBouncer instances to forward cancel requests to each other. When a PgBouncer receives a cancel request for an unknown session, it forwards the request to its peers until the correct instance is found.
+
+### How Peering Works
+
+Each PgBouncer in a peered group embeds its `peer_id` into the cancel keys it generates. When a cancel request arrives:
+
+1. PgBouncer extracts the `peer_id` from the cancel key
+2. If the `peer_id` matches its own, it processes the cancel locally
+3. If the `peer_id` belongs to a peer, it forwards the cancel request to that peer
+4. The peer then processes the cancel request as normal
+
+```
+                                    Load Balancer
+                                         |
+                    +--------------------+--------------------+
+                    |                                         |
+              PgBouncer A                               PgBouncer B
+              (peer_id=1)  <-- peering connection -->   (peer_id=2)
+                    |                                         |
+              PostgreSQL A                              PostgreSQL B
+
+1. Client connects through load balancer → routed to PgBouncer A (peer_id=1)
+2. Client runs a long query on PgBouncer A
+3. Client sends cancel request → routed to PgBouncer B
+4. PgBouncer B sees peer_id=1 in cancel key → forwards to PgBouncer A
+5. PgBouncer A receives forwarded cancel → processes successfully
+```
+
+### Configuration
+
+To enable peering, configure each PgBouncer instance with:
+
+1. A unique `peer_id` (1-16383)
+2. A `[peers]` section listing all peers in the group
+
+**Example configuration for a 2-node setup:**
+
+PgBouncer instance 1 (`pgbouncer1.ini`):
+```ini
+[pgbouncer]
+peer_id = 1
+listen_addr = 0.0.0.0
+listen_port = 6432
+; ... other settings ...
+
+[peers]
+1 = host=/var/run/pgbouncer1
+2 = host=pgbouncer2.example.com port=6432
+```
+
+PgBouncer instance 2 (`pgbouncer2.ini`):
+```ini
+[pgbouncer]
+peer_id = 2
+listen_addr = 0.0.0.0
+listen_port = 6432
+; ... other settings ...
+
+[peers]
+1 = host=pgbouncer1.example.com port=6432
+2 = host=/var/run/pgbouncer2
+```
+
+**Key configuration notes:**
+
+- The `peer_id` must be unique within the peered group (1-16383)
+- Each peer's `[peers]` section should list **all** peers, including itself
+- Including yourself in `[peers]` allows using identical configs with only `peer_id` differing
+- Peer connections can use Unix sockets (recommended for same-host) or TCP
+
+### Peer Pool Statistics
+
+Peering creates a special pool type visible in admin commands:
+
+**`SHOW PEER_POOLS`** — Shows statistics for peer connections:
+
+| Column | Description |
+|--------|-------------|
+| `peer_id` | ID of the configured peer |
+| `sv_active` | Connections actively forwarding cancel requests |
+| `sv_idle` | Idle connections to the peer |
+| `sv_used` | Connections recently used |
+| `sv_tested` | Connections being tested |
+| `sv_login` | Connections in login phase |
+
+**`SHOW PEERS`** — Shows configured peer entries and their state.
+
+### Related Configuration Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `peer_id` | 0 | Unique ID for this PgBouncer in the peered group. 0 disables peering. |
+| `cancel_wait_timeout` | 10s | How long to wait for a server connection to forward a cancel request (including to peers) |
+
+### Peering Log Messages
+
+| Log Message | Description |
+|-------------|-------------|
+| `forwarding cancel request to peer N` | Cancel request being sent to peer with ID N |
+| `successfully sent cancel request` (to peer) | Cancel forwarded to peer successfully |
+| `failed cancel request` | No matching client found locally or on any peer |
+
+### Cross-Version Peering
+
+Peering is supported between different PgBouncer versions with one important caveat:
+
+> **Warning:** The encoding of `peer_id` in cancel keys changed in version 1.21.0 ([#945](https://github.com/pgbouncer/pgbouncer/pull/945)). Peering will not work correctly if some peers are on 1.19.0-1.20.x and others are on 1.21.0+. All peers should be on the same side of the 1.21.0 version boundary.
+
+### Source Code References
+
+| File | Description |
+|------|-------------|
+| [`src/objects.c`](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_25_1/src/objects.c) | `forward_cancel_to_peer()`, peer pool management |
+| [`src/loader.c`](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_25_1/src/loader.c) | `[peers]` section parsing |
+| [`src/janitor.c`](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_25_1/src/janitor.c) | Peer connection maintenance |
 
 ---
 
@@ -255,12 +407,13 @@ See the full [NEWS.md](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_2
 
 ### Summary Table
 
-| Version | Client Cancel States | Server Cancel States | SHOW POOLS Cancel Columns |
-|---------|---------------------|---------------------|--------------------------|
-| ≤1.15 | `CL_CANCEL` | none | none |
-| 1.16-1.17 | `CL_CANCEL` | none | `cl_cancel_req` |
-| 1.18.0 | `CL_WAITING_CANCEL`, `CL_ACTIVE_CANCEL` | `SV_WAIT_CANCELS`, `SV_ACTIVE_CANCEL` | Split columns |
-| 1.19.0+ | `CL_WAITING_CANCEL`, `CL_ACTIVE_CANCEL` | `SV_BEING_CANCELED`, `SV_ACTIVE_CANCEL` | Current format |
+| Version | Client Cancel States | Server Cancel States | Peering Support |
+|---------|---------------------|---------------------|-----------------|
+| ≤1.15 | `CL_CANCEL` | none | No |
+| 1.16-1.17 | `CL_CANCEL` | none | No |
+| 1.18.0 | `CL_WAITING_CANCEL`, `CL_ACTIVE_CANCEL` | `SV_WAIT_CANCELS`, `SV_ACTIVE_CANCEL` | No |
+| 1.19.0-1.20.x | `CL_WAITING_CANCEL`, `CL_ACTIVE_CANCEL` | `SV_BEING_CANCELED`, `SV_ACTIVE_CANCEL` | Yes (v1 encoding) |
+| 1.21.0+ | `CL_WAITING_CANCEL`, `CL_ACTIVE_CANCEL` | `SV_BEING_CANCELED`, `SV_ACTIVE_CANCEL` | Yes (v2 encoding) |
 
 ### Detailed Changes
 
@@ -286,11 +439,22 @@ From the commit message ([#717](https://github.com/pgbouncer/pgbouncer/pull/717)
 
 #### Version 1.19.0
 
+- **Added peering support** for cancel requests in load-balanced setups ([#666](https://github.com/pgbouncer/pgbouncer/pull/666))
+  - New `peer_id` configuration parameter
+  - New `[peers]` configuration section
+  - New `SHOW PEERS` and `SHOW PEER_POOLS` admin commands
+  - New `cancel_wait_timeout` setting ([#833](https://github.com/pgbouncer/pgbouncer/pull/833))
 - Renamed `sv_wait_cancels` → `sv_being_canceled` for clarity ([commit `193ea03`](https://github.com/pgbouncer/pgbouncer/commit/193ea0300a9f0a4d1cbd568a2f3085ca9afc4e3a))
 
 From the commit message ([#788](https://github.com/pgbouncer/pgbouncer/pull/788)):
 
 > "The `wait_cancels` name was quite confusing. `being_canceled` makes it more clear that this is not a server that is canceling itself, but instead it's the target of a cancellation request."
+
+#### Version 1.21.0
+
+- **Changed `peer_id` encoding in cancel keys** ([#945](https://github.com/pgbouncer/pgbouncer/pull/945))
+  - This is a breaking change for cross-version peering
+  - Peers on 1.19.0-1.20.x cannot interoperate with peers on 1.21.0+
 
 ---
 
@@ -312,6 +476,42 @@ This state is for servers that had a query explicitly cancelled (via `CancelRequ
 
 Use `SHOW SERVERS` ([implementation](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_25_1/src/admin.c#L793)) and look for servers with state `being_canceled`, or check the `sv_being_canceled` column in `SHOW POOLS` ([implementation](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_25_1/src/admin.c#L896)).
 
+### Q: Why do I see "failed cancel request" in my logs?
+
+This typically occurs when:
+1. The client that initiated the query has already disconnected
+2. The query completed before the cancel request arrived
+3. **You're running multiple PgBouncer instances** (load-balanced or with `so_reuseport`) without peering configured
+
+For load-balanced setups, enable [peering](#cancel-requests-in-load-balanced-setups-peering) so cancel requests can be forwarded to the correct PgBouncer instance.
+
+### Q: Do I need peering if I run a single PgBouncer instance?
+
+**No.** Peering is only needed when you have multiple PgBouncer instances (processes) that might receive connections from the same clients. Common scenarios requiring peering:
+
+- Multiple PgBouncer processes using `so_reuseport` on the same port
+- Multiple PgBouncer instances behind a TCP load balancer (HAProxy, nginx, etc.)
+- Active/passive PgBouncer setups where clients might connect to either
+
+### Q: Can I mix PgBouncer versions in a peered group?
+
+**Partially.** Cross-version peering works, but there's a compatibility boundary at version 1.21.0:
+
+- All peers on 1.19.0-1.20.x: Works
+- All peers on 1.21.0+: Works
+- Mixed (some on 1.19.0-1.20.x, some on 1.21.0+): **Does not work**
+
+This is because the encoding of `peer_id` in cancel keys changed in 1.21.0 ([#945](https://github.com/pgbouncer/pgbouncer/pull/945)).
+
+### Q: What happens if a peer is down?
+
+If a cancel request needs to be forwarded to a peer that is unreachable:
+1. PgBouncer will attempt to connect to the peer
+2. If connection fails or times out, the cancel request fails
+3. The `cancel_wait_timeout` setting (default 10s) controls how long to wait
+
+The original query continues running; the client just won't be able to cancel it.
+
 ---
 
 ## Key Source Files
@@ -329,6 +529,7 @@ Use `SHOW SERVERS` ([implementation](https://github.com/pgbouncer/pgbouncer/blob
 
 ## Related Issues and Pull Requests
 
+### Cancel Request Handling
 - [#717](https://github.com/pgbouncer/pgbouncer/pull/717) - Handle race condition between cancel requests and server reuse
 - [#788](https://github.com/pgbouncer/pgbouncer/pull/788) - Rename wait_cancels state to being_canceled
 - [#544](https://github.com/pgbouncer/pgbouncer/issues/544) - Original race condition issue
@@ -336,3 +537,10 @@ Use `SHOW SERVERS` ([implementation](https://github.com/pgbouncer/pgbouncer/blob
 - [#815](https://github.com/pgbouncer/pgbouncer/pull/815) - Fix disconnect_server on BEING_CANCELED state
 - [#927](https://github.com/pgbouncer/pgbouncer/pull/927) - Fix server_proto bad state error
 - [#928](https://github.com/pgbouncer/pgbouncer/pull/928) - Fix client_proto bad state error
+
+### Peering
+- [#666](https://github.com/pgbouncer/pgbouncer/pull/666) - Add PgBouncer peering support (introduced in 1.19.0)
+- [#945](https://github.com/pgbouncer/pgbouncer/pull/945) - Change peer_id encoding in cancel keys (1.21.0)
+- [#922](https://github.com/pgbouncer/pgbouncer/pull/922) - Fix slog log prefix for peers
+- [#864](https://github.com/pgbouncer/pgbouncer/pull/864) - Fix name of peer_cache slab storage
+- [#832](https://github.com/pgbouncer/pgbouncer/pull/832) - Document maximum value for peer_id
